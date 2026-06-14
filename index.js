@@ -23,7 +23,7 @@ async function main() {
   console.log("Connecting to Solana mainnet via WebSocket...");
 
   const connection = new Connection(
-    process.env.SOLANA_RPC_WSS,
+    process.env.SOLANA_RPC_HTTPS,
     {
       wsEndpoint: process.env.SOLANA_RPC_WSS,
       commitment: "confirmed",
