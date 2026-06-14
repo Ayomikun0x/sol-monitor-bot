@@ -36,26 +36,43 @@ const MIN_LIQ_USD         = Number(process.env.MIN_LIQUIDITY_USD || 500);
 async function getTokenInfo(mint) {
   if (tokenInfoCache.has(mint)) return tokenInfoCache.get(mint);
   try {
+    // Try pump.fun API first
     const res = await Promise.race([
-      axios.get(`https://tokens.jup.ag/token/${mint}`, { timeout: 5000 }),
+      axios.get(`https://frontend-api.pump.fun/coins/${mint}`, { timeout: 5000 }),
       new Promise((_, r) => setTimeout(() => r(new Error("timeout")), 6000))
     ]);
     const data = res.data;
     const info = {
       name: data.name || "Unknown",
       symbol: data.symbol || "???",
-      decimals: data.decimals || 9,
-      totalSupply: data.extensions?.coingeckoId ? 0 : 1000000000,
+      decimals: 6,
+      totalSupply: 1000000000,
     };
     tokenInfoCache.set(mint, info);
     return info;
   } catch {
-    const fallback = { name: "Unknown", symbol: "???", decimals: 9, totalSupply: 1000000000 };
-    tokenInfoCache.set(mint, fallback);
-    return fallback;
+    // Fallback to Jupiter
+    try {
+      const res = await Promise.race([
+        axios.get(`https://tokens.jup.ag/token/${mint}`, { timeout: 5000 }),
+        new Promise((_, r) => setTimeout(() => r(new Error("timeout")), 6000))
+      ]);
+      const data = res.data;
+      const info = {
+        name: data.name || "Unknown",
+        symbol: data.symbol || "???",
+        decimals: data.decimals || 6,
+        totalSupply: 1000000000,
+      };
+      tokenInfoCache.set(mint, info);
+      return info;
+    } catch {
+      const fallback = { name: "Unknown", symbol: "???", decimals: 6, totalSupply: 1000000000 };
+      tokenInfoCache.set(mint, fallback);
+      return fallback;
+    }
   }
 }
-
 // ─── Get token price from Jupiter ───
 async function getTokenPrice(mint) {
   try {
@@ -117,7 +134,7 @@ async function handlePumpFunNew(connection, signature, accountKeys) {
     const mint      = accountKeys[1]?.toString();
     const deployer  = accountKeys[0]?.toString();
     if (!mint || !deployer) return;
-
+    if (qualifiedTokens.has(mint)) return;
     const tokenInfo = await getTokenInfo(mint);
     const solPrice  = await getSolPriceUSD();
     const price     = await getTokenPrice(mint);
