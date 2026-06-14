@@ -11,28 +11,20 @@ const {
 } = require("./notifier");
 const { getSolPriceUSD } = require("./price");
 
-// ─── Program IDs ───
-const PUMP_FUN_PROGRAM    = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
-const RAYDIUM_AMM         = new PublicKey("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
-const RAYDIUM_CLMM        = new PublicKey("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK");
-const ORCA_WHIRLPOOL      = new PublicKey("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc");
-const METEORA_DLMM        = new PublicKey("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
-const METEORA_POOLS       = new PublicKey("Eo7WjKq67rjJQDd1d4Hazh3NJUmLTpaLQQT2DcJvhMkB");
+const RAYDIUM_AMM        = new PublicKey("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8");
+const PUMP_FUN_MIGRATION = new PublicKey("39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg");
 
-// Pump.fun graduation — when token moves to Raydium
-const PUMP_FUN_MIGRATION  = new PublicKey("39azUYFWPz3VHgKCf3VChUwbpURdCHRxjWVowf5jUJjg");
+const firstBuyDone       = new Set();
+const priceTrackers      = new Map();
+const liquidityAddedTime = new Map();
+const qualifiedTokens    = new Set();
+const tokenInfoCache     = new Map();
+const processedSigs      = new Set();
 
-const firstBuyDone        = new Set();
-const priceTrackers       = new Map();
-const liquidityAddedTime  = new Map();
-const qualifiedTokens     = new Set();
-const tokenInfoCache      = new Map();
+const MILESTONES      = [50, 100, 150, 200, 300, 500, 1000];
+const SNIPE_WINDOW_MS = 60000;
+const MIN_LIQ_USD     = Number(process.env.MIN_LIQUIDITY_USD || 500);
 
-const MILESTONES          = [50, 100, 150, 200, 300, 500, 1000];
-const SNIPE_WINDOW_MS     = 60000;
-const MIN_LIQ_USD         = Number(process.env.MIN_LIQUIDITY_USD || 500);
-
-// ─── Fetch token metadata from Jupiter ───
 async function getTokenInfo(mint) {
   if (tokenInfoCache.has(mint)) return tokenInfoCache.get(mint);
   try {
@@ -51,7 +43,6 @@ async function getTokenInfo(mint) {
     tokenInfoCache.set(mint, info);
     return info;
   } catch {
-    // Fallback to Jupiter
     try {
       const res = await Promise.race([
         axios.get(`https://tokens.jup.ag/token/${mint}`, { timeout: 5000 }),
@@ -73,7 +64,7 @@ async function getTokenInfo(mint) {
     }
   }
 }
-// ─── Get token price from Jupiter ───
+
 async function getTokenPrice(mint) {
   try {
     const res = await Promise.race([
@@ -87,7 +78,6 @@ async function getTokenPrice(mint) {
   }
 }
 
-// ─── Format price ───
 function formatPrice(p) {
   if (!p || p === 0) return "0";
   if (p < 0.000000001) return p.toExponential(4);
@@ -107,7 +97,6 @@ function formatNumber(n) {
   return num.toFixed(4);
 }
 
-// ─── Check price milestones ───
 async function checkMilestone(mint, name, symbol, currentPrice) {
   const tracker = priceTrackers.get(mint);
   if (!tracker || !tracker.firstBuyPrice) return;
@@ -128,292 +117,192 @@ async function checkMilestone(mint, name, symbol, currentPrice) {
   }
 }
 
-// ─── Parse pump.fun new token ───
-async function handlePumpFunNew(connection, signature, accountKeys) {
-  try {
-    const mint      = accountKeys[1]?.toString();
-    const deployer  = accountKeys[0]?.toString();
-    if (!mint || !deployer) return;
-    if (qualifiedTokens.has(mint)) return;
-    const tokenInfo = await getTokenInfo(mint);
-    const solPrice  = await getSolPriceUSD();
-    const price     = await getTokenPrice(mint);
-    const marketCap = price * tokenInfo.totalSupply;
+async function startMonitor(connection) {
+  console.log("Starting Solana monitor — Raydium + Pump.fun graduation only...");
 
-    qualifiedTokens.add(mint);
-    liquidityAddedTime.set(mint, Date.now());
+  // Watch Raydium AMM
+  connection.onLogs(RAYDIUM_AMM, async (logs, ctx) => {
+    try {
+      if (!logs.logs || !logs.signature) return;
+      const sig = logs.signature;
 
-    await alertNewToken({
-      name: tokenInfo.name,
-      symbol: tokenInfo.symbol,
-      address: mint,
-      deployer,
-      txHash: signature,
-      dex: "Pump.fun",
-      marketCap: marketCap > 0 ? marketCap : solPrice * 30, // estimate ~30 SOL initial
-    });
-  } catch (err) {
-    console.error("PumpFun new token error:", err.message);
-  }
-}
+      // Prevent duplicate processing
+      if (processedSigs.has(sig)) return;
+      processedSigs.add(sig);
+      if (processedSigs.size > 1000) {
+        const first = processedSigs.values().next().value;
+        processedSigs.delete(first);
+      }
 
-// ─── Parse pump.fun graduation ───
-async function handlePumpFunGraduation(connection, signature, accountKeys) {
-  try {
-    const mint     = accountKeys[2]?.toString();
-    const deployer = accountKeys[0]?.toString();
-    if (!mint) return;
+      const tx = await connection.getParsedTransaction(sig, {
+        maxSupportedTransactionVersion: 0,
+        commitment: "confirmed",
+      });
+      if (!tx) return;
 
-    const tokenInfo = await getTokenInfo(mint);
-    const solPrice  = await getSolPriceUSD();
-    const price     = await getTokenPrice(mint);
-    const liquidityUSD = solPrice * 85; // pump.fun graduation = ~85 SOL
-    const marketCap    = price * tokenInfo.totalSupply;
+      const accountKeys  = tx.transaction.message.accountKeys.map(k => k.pubkey.toString());
+      const preBalances  = tx.meta?.preBalances || [];
+      const postBalances = tx.meta?.postBalances || [];
+      const solChange    = Math.abs((postBalances[0] - preBalances[0]) / 1e9);
+      const logMessages  = logs.logs || [];
 
-    await alertGraduation({
-      name: tokenInfo.name,
-      symbol: tokenInfo.symbol,
-      address: mint,
-      txHash: signature,
-      liquidityUSD,
-      price: formatPrice(price),
-      marketCap,
-    });
-  } catch (err) {
-    console.error("Graduation error:", err.message);
-  }
-}
+      // Liquidity added
+      if (logMessages.some(l => l.includes("initialize2") || l.includes("InitializeInstruction2"))) {
+        const mint     = accountKeys[8]?.toString();
+        const provider = accountKeys[0]?.toString();
+        if (!mint || !provider) return;
 
-// ─── Parse Raydium liquidity add ───
-async function handleRaydiumMint(connection, signature, accountKeys, solAmount) {
-  try {
-    const mint     = accountKeys[8]?.toString();
-    const provider = accountKeys[0]?.toString();
-    if (!mint || !provider) return;
+        const tokenInfo = await getTokenInfo(mint);
+        const solPrice  = await getSolPriceUSD();
+        const price     = await getTokenPrice(mint);
+        const valueUSD  = solChange * solPrice;
+        const marketCap = price * tokenInfo.totalSupply;
 
-    const tokenInfo  = await getTokenInfo(mint);
-    const solPrice   = await getSolPriceUSD();
-    const price      = await getTokenPrice(mint);
-    const valueUSD   = solAmount * solPrice;
-    const marketCap  = price * tokenInfo.totalSupply;
+        if (valueUSD < MIN_LIQ_USD) return;
+        if (!liquidityAddedTime.has(mint)) liquidityAddedTime.set(mint, Date.now());
+        qualifiedTokens.add(mint);
 
-    if (valueUSD < MIN_LIQ_USD) return;
+        console.log("Liquidity added: " + tokenInfo.symbol + " $" + valueUSD.toFixed(2));
 
-    if (!liquidityAddedTime.has(mint)) liquidityAddedTime.set(mint, Date.now());
-    qualifiedTokens.add(mint);
+        await alertNewToken({
+          name: tokenInfo.name,
+          symbol: tokenInfo.symbol,
+          address: mint,
+          deployer: provider,
+          txHash: sig,
+          dex: "Raydium",
+          marketCap: marketCap > 0 ? marketCap : valueUSD * 2,
+        });
 
-    await alertLiquidityAdded({
-      name: tokenInfo.name,
-      symbol: tokenInfo.symbol,
-      address: mint,
-      provider,
-      solAmount: solAmount.toFixed(4),
-      tokenAmount: 0,
-      totalLiqUSD: valueUSD.toFixed(2),
-      txHash: signature,
-      dex: "Raydium",
-      price: formatPrice(price),
-      marketCap: formatNumber(marketCap),
-      lpStatus: "🔓 Unlocked ⚠️",
-    });
-  } catch (err) {
-    console.error("Raydium mint error:", err.message);
-  }
-}
+        await alertLiquidityAdded({
+          name: tokenInfo.name,
+          symbol: tokenInfo.symbol,
+          address: mint,
+          provider,
+          solAmount: solChange.toFixed(4),
+          tokenAmount: 0,
+          totalLiqUSD: valueUSD.toFixed(2),
+          txHash: sig,
+          dex: "Raydium",
+          price: formatPrice(price),
+          marketCap: formatNumber(marketCap),
+          lpStatus: "🔓 Unlocked ⚠️",
+        });
+      }
 
-// ─── Parse swap / first buy ───
-async function handleSwap(connection, signature, accountKeys, mint, solAmount, dex) {
-  try {
-    if (!qualifiedTokens.has(mint)) return;
-    const buyer     = accountKeys[0]?.toString();
-    const tokenInfo = await getTokenInfo(mint);
-    const solPrice  = await getSolPriceUSD();
-    const price     = await getTokenPrice(mint);
-    const valueUSD  = solAmount * solPrice;
+      // Swap — first buy + milestones
+      else if (logMessages.some(l => l.includes("Instruction: Swap") || l.includes("SwapBaseIn") || l.includes("SwapBaseOut"))) {
+        const mint = accountKeys[16]?.toString() || accountKeys[8]?.toString();
+        if (!mint || !qualifiedTokens.has(mint)) return;
 
-    if (!firstBuyDone.has(mint)) {
-      firstBuyDone.add(mint);
-      priceTrackers.set(mint, { firstBuyPrice: price, nextMilestone: MILESTONES[0] });
+        const buyer     = accountKeys[0]?.toString();
+        const tokenInfo = await getTokenInfo(mint);
+        const solPrice  = await getSolPriceUSD();
+        const price     = await getTokenPrice(mint);
+        const valueUSD  = solChange * solPrice;
 
-      const liqTime = liquidityAddedTime.get(mint) || 0;
-      const isSnipe = (Date.now() - liqTime) <= SNIPE_WINDOW_MS;
+        if (!firstBuyDone.has(mint)) {
+          firstBuyDone.add(mint);
+          priceTrackers.set(mint, { firstBuyPrice: price, nextMilestone: MILESTONES[0] });
 
-      await alertFirstBuy({
+          const liqTime = liquidityAddedTime.get(mint) || 0;
+          const isSnipe = (Date.now() - liqTime) <= SNIPE_WINDOW_MS;
+
+          await alertFirstBuy({
+            name: tokenInfo.name,
+            symbol: tokenInfo.symbol,
+            address: mint,
+            buyer,
+            solAmount: solChange.toFixed(4),
+            tokenAmount: 0,
+            valueUSD,
+            txHash: sig,
+            isSnipe,
+          });
+        } else {
+          await checkMilestone(mint, tokenInfo.name, tokenInfo.symbol, price);
+        }
+      }
+
+      // Remove liquidity
+      else if (logMessages.some(l => l.includes("WithdrawInstruction") || l.includes("Instruction: Withdraw"))) {
+        const mint     = accountKeys[8]?.toString();
+        const provider = accountKeys[0]?.toString();
+        if (!mint || !qualifiedTokens.has(mint)) return;
+
+        const tokenInfo = await getTokenInfo(mint);
+
+        await alertLiquidityWarning({
+          name: tokenInfo.name,
+          symbol: tokenInfo.symbol,
+          address: mint,
+          removalPct: "?",
+          provider,
+          txHash: sig,
+        });
+
+        await new Promise(r => setTimeout(r, 1500));
+
+        await alertLiquidityRemoved({
+          name: tokenInfo.name,
+          symbol: tokenInfo.symbol,
+          address: mint,
+          provider,
+          solAmount: solChange.toFixed(4),
+          tokenAmount: 0,
+          removedPct: "?",
+          txHash: sig,
+        });
+      }
+    } catch (err) {
+      console.error("Raydium log error:", err.message);
+    }
+  }, "confirmed");
+
+  // Watch pump.fun graduation to Raydium
+  connection.onLogs(PUMP_FUN_MIGRATION, async (logs, ctx) => {
+    try {
+      if (!logs.logs || !logs.signature) return;
+      const sig = logs.signature;
+      if (processedSigs.has(sig)) return;
+      processedSigs.add(sig);
+
+      const tx = await connection.getParsedTransaction(sig, {
+        maxSupportedTransactionVersion: 0,
+        commitment: "confirmed",
+      });
+      if (!tx) return;
+
+      const accountKeys = tx.transaction.message.accountKeys.map(k => k.pubkey.toString());
+      const mint        = accountKeys[2]?.toString();
+      if (!mint) return;
+
+      const tokenInfo = await getTokenInfo(mint);
+      const solPrice  = await getSolPriceUSD();
+      const price     = await getTokenPrice(mint);
+      const marketCap = price * tokenInfo.totalSupply;
+
+      console.log("Graduation detected: " + tokenInfo.symbol);
+
+      qualifiedTokens.add(mint);
+      liquidityAddedTime.set(mint, Date.now());
+
+      await alertGraduation({
         name: tokenInfo.name,
         symbol: tokenInfo.symbol,
         address: mint,
-        buyer,
-        solAmount: solAmount.toFixed(4),
-        tokenAmount: 0,
-        valueUSD,
-        txHash: signature,
-        isSnipe,
+        txHash: sig,
+        liquidityUSD: solPrice * 85,
+        price: formatPrice(price),
+        marketCap,
       });
-    } else {
-      await checkMilestone(mint, tokenInfo.name, tokenInfo.symbol, price);
+    } catch (err) {
+      console.error("Graduation error:", err.message);
     }
-  } catch (err) {
-    console.error("Swap error:", err.message);
-  }
-}
-
-// ─── Main monitor ───
-async function startMonitor(connection) {
-  console.log("Starting Solana monitor...");
-
-  // Watch Pump.fun
-  connection.onProgramAccountChange(
-    PUMP_FUN_PROGRAM,
-    async (accountInfo, context) => {
-      try {
-        const sigs = await connection.getSignaturesForAddress(
-          PUMP_FUN_PROGRAM, { limit: 1 }
-        );
-        if (!sigs.length) return;
-        const sig = sigs[0].signature;
-        const tx  = await connection.getParsedTransaction(sig, {
-          maxSupportedTransactionVersion: 0,
-          commitment: "confirmed",
-        });
-        if (!tx) return;
-        const accountKeys = tx.transaction.message.accountKeys.map(k => k.pubkey.toString());
-        const logMessages = tx.meta?.logMessages || [];
-
-        if (logMessages.some(l => l.includes("InitializeMint"))) {
-          await handlePumpFunNew(connection, sig, accountKeys);
-        }
-      } catch {}
-    },
-    "confirmed"
-  );
-
-  // Watch Raydium AMM logs
-  connection.onLogs(RAYDIUM_AMM, async (logs, ctx) => {
-    try {
-      if (!logs.logs) return;
-      const sig = logs.signature;
-      const tx  = await connection.getParsedTransaction(sig, {
-        maxSupportedTransactionVersion: 0,
-        commitment: "confirmed",
-      });
-      if (!tx) return;
-      const accountKeys = tx.transaction.message.accountKeys.map(k => k.pubkey.toString());
-      const preBalances  = tx.meta?.preBalances || [];
-      const postBalances = tx.meta?.postBalances || [];
-      const solChange    = Math.abs((postBalances[0] - preBalances[0]) / 1e9);
-
-      if (logs.logs.some(l => l.includes("initialize2") || l.includes("addLiquidity"))) {
-        await handleRaydiumMint(connection, sig, accountKeys, solChange);
-      } else if (logs.logs.some(l => l.includes("swap"))) {
-        const mint = accountKeys[8]?.toString();
-        if (mint) await handleSwap(connection, sig, accountKeys, mint, solChange, "Raydium");
-      }
-    } catch {}
   }, "confirmed");
 
-  // Watch Orca Whirlpool logs
-  connection.onLogs(ORCA_WHIRLPOOL, async (logs, ctx) => {
-    try {
-      if (!logs.logs) return;
-      const sig = logs.signature;
-      const tx  = await connection.getParsedTransaction(sig, {
-        maxSupportedTransactionVersion: 0,
-        commitment: "confirmed",
-      });
-      if (!tx) return;
-      const accountKeys = tx.transaction.message.accountKeys.map(k => k.pubkey.toString());
-      const preBalances  = tx.meta?.preBalances || [];
-      const postBalances = tx.meta?.postBalances || [];
-      const solChange    = Math.abs((postBalances[0] - preBalances[0]) / 1e9);
-
-      if (logs.logs.some(l => l.includes("increaseLiquidity") || l.includes("initializePool"))) {
-        const mint = accountKeys[4]?.toString();
-        if (mint) {
-          const tokenInfo = await getTokenInfo(mint);
-          const solPrice  = await getSolPriceUSD();
-          const price     = await getTokenPrice(mint);
-          const valueUSD  = solChange * solPrice;
-          const marketCap = price * tokenInfo.totalSupply;
-          if (valueUSD < MIN_LIQ_USD) return;
-          if (!liquidityAddedTime.has(mint)) liquidityAddedTime.set(mint, Date.now());
-          qualifiedTokens.add(mint);
-          await alertLiquidityAdded({
-            name: tokenInfo.name, symbol: tokenInfo.symbol,
-            address: mint, provider: accountKeys[0],
-            solAmount: solChange.toFixed(4), tokenAmount: 0,
-            totalLiqUSD: valueUSD.toFixed(2), txHash: sig,
-            dex: "Orca", price: formatPrice(price),
-            marketCap: formatNumber(marketCap),
-            lpStatus: "❓ Unknown",
-          });
-        }
-      } else if (logs.logs.some(l => l.includes("swap"))) {
-        const mint = accountKeys[4]?.toString();
-        if (mint) await handleSwap(connection, sig, accountKeys, mint, solChange, "Orca");
-      }
-    } catch {}
-  }, "confirmed");
-
-  // Watch Meteora logs
-  connection.onLogs(METEORA_DLMM, async (logs, ctx) => {
-    try {
-      if (!logs.logs) return;
-      const sig = logs.signature;
-      const tx  = await connection.getParsedTransaction(sig, {
-        maxSupportedTransactionVersion: 0,
-        commitment: "confirmed",
-      });
-      if (!tx) return;
-      const accountKeys = tx.transaction.message.accountKeys.map(k => k.pubkey.toString());
-      const preBalances  = tx.meta?.preBalances || [];
-      const postBalances = tx.meta?.postBalances || [];
-      const solChange    = Math.abs((postBalances[0] - preBalances[0]) / 1e9);
-
-      if (logs.logs.some(l => l.includes("addLiquidity") || l.includes("initializeLbPair"))) {
-        const mint = accountKeys[3]?.toString();
-        if (mint) {
-          const tokenInfo = await getTokenInfo(mint);
-          const solPrice  = await getSolPriceUSD();
-          const price     = await getTokenPrice(mint);
-          const valueUSD  = solChange * solPrice;
-          const marketCap = price * tokenInfo.totalSupply;
-          if (valueUSD < MIN_LIQ_USD) return;
-          if (!liquidityAddedTime.has(mint)) liquidityAddedTime.set(mint, Date.now());
-          qualifiedTokens.add(mint);
-          await alertLiquidityAdded({
-            name: tokenInfo.name, symbol: tokenInfo.symbol,
-            address: mint, provider: accountKeys[0],
-            solAmount: solChange.toFixed(4), tokenAmount: 0,
-            totalLiqUSD: valueUSD.toFixed(2), txHash: sig,
-            dex: "Meteora", price: formatPrice(price),
-            marketCap: formatNumber(marketCap),
-            lpStatus: "❓ Unknown",
-          });
-        }
-      } else if (logs.logs.some(l => l.includes("swap"))) {
-        const mint = accountKeys[3]?.toString();
-        if (mint) await handleSwap(connection, sig, accountKeys, mint, solChange, "Meteora");
-      }
-    } catch {}
-  }, "confirmed");
-
-  // Watch pump.fun graduation
-  connection.onLogs(PUMP_FUN_MIGRATION, async (logs, ctx) => {
-    try {
-      if (!logs.logs) return;
-      const sig = logs.signature;
-      const tx  = await connection.getParsedTransaction(sig, {
-        maxSupportedTransactionVersion: 0,
-        commitment: "confirmed",
-      });
-      if (!tx) return;
-      const accountKeys = tx.transaction.message.accountKeys.map(k => k.pubkey.toString());
-      await handlePumpFunGraduation(connection, sig, accountKeys);
-    } catch {}
-  }, "confirmed");
-
-  console.log("Monitoring: Pump.fun · Raydium · Orca · Meteora");
-  return 4;
+  console.log("Monitoring: Raydium AMM + Pump.fun Graduation");
+  return 2;
 }
 
 module.exports = { startMonitor };
